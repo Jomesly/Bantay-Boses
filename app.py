@@ -112,6 +112,10 @@ def _load_email(sample: dict) -> None:
     _request_scan("email")
 
 
+def _toggle_lola() -> None:
+    ss["lola"] = not bool(ss.get("lola"))
+
+
 def _clear(kind: str) -> None:
     if kind == "sms":
         ss["sms_text"] = ""
@@ -424,7 +428,14 @@ head_l, head_r = st.columns([1, 1], vertical_alignment="center")
 with head_l:
     st.html(ui.brand(llm_on))
 with head_r:
-    st.toggle("Lola Mode", key="lola", help="Mas malaking text, mas kaunting pindutan")
+    st.button(
+        "Lola Mode",
+        key="lola_btn",
+        on_click=_toggle_lola,
+        type="primary" if lola else "secondary",
+        icon=":material/accessibility_new:",
+        help="Mas malaking text, mas kaunting pindutan. Pindutin ang salitang ito.",
+    )
 
 if ss.get("kind") not in ("sms", "email"):
     ss["kind"] = "sms"

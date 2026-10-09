@@ -123,10 +123,14 @@ check("SMS/Email tab switch (both ways)", t_tabs)
 
 def t_lola_css():
     at = fresh(); at.run()
-    at.get_by_key("lola").set_value(True); at.run(); no_exc(at, "lola on")
+    btn = at.get_by_key("lola_btn")
+    assert getattr(btn, "label", "") == "Lola Mode", f"word not the button: {getattr(btn, 'label', None)}"
+    assert "bb-lola-verdict" not in html_text(at), "Lola CSS on before enabling"
+    at.get_by_key("lola_btn").click(); at.run(); no_exc(at, "lola on")
     assert "bb-lola-verdict" in html_text(at), "Lola CSS layer not injected"
-    at.get_by_key("lola").set_value(False); at.run(); no_exc(at, "lola off")
-check("Lola Mode toggle injects Lola CSS", t_lola_css)
+    at.get_by_key("lola_btn").click(); at.run(); no_exc(at, "lola off")
+    assert "bb-lola-verdict" not in html_text(at), "Lola CSS still on after toggling off"
+check("Lola Mode button toggles Lola CSS on/off", t_lola_css)
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +227,8 @@ check("Clear 'Burahin' with content -> textarea emptied", t_clear_with_content)
 # ---------------------------------------------------------------------------
 def t_lola_scan():
     at = fresh(); at.run()
-    at.get_by_key("lola").set_value(True); at.run()
+    at.get_by_key("lola_btn").click(); at.run()
+    assert at.session_state["lola"] is True, "lola state not set"
     at.get_by_key("demo_scam_sms").click(); at.run(); no_exc(at, "lola scan")
     assert "SCAM ITO" in html_text(at), "no big Lola verdict"
     assert "bb-lola-verdict" in html_text(at), "Lola verdict card missing"
