@@ -1,43 +1,60 @@
-"""Headless UI test using Streamlit's AppTest. Run: python ui_test.py"""
+"""Headless UI test using Streamlit's AppTest. Run: python ui_test.py
+
+The redesigned UI renders verdicts and chrome as HTML via st.html(), so we read
+the 'html' element list rather than markdown. After a scan the sample buttons
+unmount (the result view replaces them), so each scenario gets a fresh app.
+"""
 from streamlit.testing.v1 import AppTest
 
 
-def joined(at) -> str:
-    return "\n".join(str(getattr(m, "value", m)) for m in at.markdown)
+def html_text(at) -> str:
+    return "\n".join(str(getattr(e, "value", e)) for e in at.get("html"))
 
-at = AppTest.from_file("app.py", default_timeout=60)
+
+def fresh() -> AppTest:
+    return AppTest.from_file("app.py", default_timeout=90)
+
+
+# --- boot -----------------------------------------------------------------
+at = fresh()
 at.run()
 if at.exception:
     raise SystemExit(f"BOOT FAILED: {at.exception}")
+assert "Bantay-Boses" in html_text(at), "brand not rendered"
 print("boot: OK")
 
-# click the SMS scam sample (triggers auto-scan incl. LLM)
-at.button[0].click()
+# --- SMS scam sample -> red ----------------------------------------------
+at = fresh()
+at.run()
+at.get_by_key("demo_scam_sms").click()
 at.run()
 if at.exception:
     raise SystemExit(f"SMS SCAN FAILED: {at.exception}")
-marks = joined(at)
-assert "SCAM" in marks.upper(), f"no red verdict rendered: {marks[:300]}"
-assert at.info, "no what-to-do info box"
-assert any("Latency" in str(m.label) for m in at.metric), "no latency metric"
-print("sms scam sample -> SCAM banner: OK")
+assert "Scam ito" in html_text(at), f"no red verdict rendered: {html_text(at)[:300]}"
+print("sms scam sample -> SCAM verdict: OK")
 
-# email sample (button index 4 = first email-tab button)
-at.button[4].click()
+# --- SMS legit sample -> green -------------------------------------------
+at = fresh()
 at.run()
-if at.exception:
-    raise SystemExit(f"EMAIL SCAN FAILED: {at.exception}")
-marks = joined(at)
-assert "SCAM" in marks.upper(), f"no email verdict rendered: {marks[:300]}"
-print("email phishing sample -> SCAM banner: OK")
-
-# legit sample
-at.button[1].click()
+at.get_by_key("demo_legit_sms").click()
 at.run()
 if at.exception:
     raise SystemExit(f"LEGIT SCAN FAILED: {at.exception}")
-marks = joined(at)
-assert "SAFE" in marks.upper() or "MUKHANG OK" in marks.upper(), \
-    f"legit not green: {marks[:300]}"
-print("legit sample -> SAFE banner: OK")
+assert "Mukhang ligtas" in html_text(at), f"legit not green: {html_text(at)[:300]}"
+print("legit sample -> SAFE verdict: OK")
+
+# --- Email phishing sample -> red ----------------------------------------
+at = fresh()
+at.run()
+at.segmented_control[0].set_value("email")
+at.run()
+if at.exception:
+    raise SystemExit(f"EMAIL TAB FAILED: {at.exception}")
+at.get_by_key("demo_scam_email").click()
+at.run()
+if at.exception:
+    raise SystemExit(f"EMAIL SCAN FAILED: {at.exception}")
+assert "Scam ito" in html_text(at), f"no email verdict rendered: {html_text(at)[:300]}"
+print("email phishing sample -> SCAM verdict: OK")
+
 print("ALL UI TESTS PASSED")

@@ -1,0 +1,22 @@
+# Mirrors the key tokens in theme.py so native widgets match before CSS loads.
+[theme]
+base = "dark"
+primaryColor = "#A9B5FF"
+backgroundColor = "#0E1014"
+secondaryBackgroundColor = "#1E222B"
+textColor = "#ECEEF2"
+borderColor = "#2C313C"
+font = "sans-serif"
+baseRadius = "8px"
+showWidgetBorder = true
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = "none"
+
+[browser]
+# Fully offline: no telemetry.
+gatherUsageStats = false
+
+[server]
+headless = true

@@ -2,24 +2,24 @@
 
 Run:  streamlit run app.py
 Everything (LLM inference, rules, OCR) runs on this device.
+
+UI layout lives here; styling in theme.py; HTML builders in components.py.
+State changes happen in widget callbacks so Streamlit never mutates a widget
+key after it has rendered.
 """
 from __future__ import annotations
 
-import html
-import time
+import sqlite3
 from time import perf_counter
 
 import streamlit as st
 
+import components as ui
 import db
 import rules
 import scoring
+import theme
 from llm import classify, server_up
-
-
-@st.cache_data(ttl=60)
-def _llm_alive() -> bool:
-    return server_up()
 
 try:
     from ocr import image_to_text
@@ -27,7 +27,14 @@ try:
 except Exception:
     OCR_OK = False
 
-st.set_page_config(page_title="Bantay-Boses", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Bantay-Boses · Scam checker", page_icon=":material/shield:",
+                   layout="centered", initial_sidebar_state="collapsed")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _llm_alive() -> bool:
+    return server_up()
+
 
 # ---------------------------------------------------------------------------
 # Samples
@@ -69,296 +76,383 @@ SAMPLE_EMAIL_LEGIT = {
     ),
     "attachments": "",
 }
-
-LEVEL_STYLE = {
-    "red":   ("🔴", "SCAM / PEKE", "#b71c1c", "Mukhang scam ito — huwag mong pansinin."),
-    "yellow": ("⚠️", "SUSPICIOUS / MAG-INGAT", "#e65100", "Duda ito — mag-ingat at i-verify muna."),
-    "green": ("✅", "SAFE / MUKHANG OK", "#2e7d32", "Walang nakitang scam pattern."),
-}
+EMAIL_FIELDS = ("sender", "reply_to", "subject", "body", "attachments")
 
 # ---------------------------------------------------------------------------
-# Helpers
+# State + callbacks
 # ---------------------------------------------------------------------------
 
-def _highlight(text: str, flags: list[dict]) -> str:
-    """Return HTML of `text` with flag matches wrapped in <mark>."""
-    low = text.lower()
-    spans: list[tuple[int, int]] = []
-    for f in flags:
-        m = (f.get("match") or "").lower().strip()
-        if not m or len(m) < 3:
-            continue
-        start = 0
-        while True:
-            i = low.find(m, start)
-            if i == -1:
-                break
-            spans.append((i, i + len(m)))
-            start = i + len(m)
-    if not spans:
-        return html.escape(text)
-    spans.sort()
-    merged: list[tuple[int, int]] = []
-    for s, e in spans:
-        if merged and s <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+ss = st.session_state
+ss.setdefault("kind", "sms")
+ss.setdefault("lola", False)
+ss.setdefault("upload_n", 0)
+ss.setdefault("sms_text", "")
+for _f in EMAIL_FIELDS:
+    ss.setdefault(f"em_{_f}", "")
+
+
+def _notice(kind: str, level: str, title: str, body: str) -> None:
+    ss[f"notice_{kind}"] = (level, title, body)
+
+
+def _request_scan(kind: str, save: bool = True) -> None:
+    ss["pending_scan"] = (kind, save)
+
+
+def _load_sms(text: str) -> None:
+    ss["kind"] = "sms"
+    ss["sms_text"] = text
+    _request_scan("sms")
+
+
+def _load_email(sample: dict) -> None:
+    ss["kind"] = "email"
+    for k in EMAIL_FIELDS:
+        ss[f"em_{k}"] = sample.get(k, "")
+    _request_scan("email")
+
+
+def _clear(kind: str) -> None:
+    if kind == "sms":
+        ss["sms_text"] = ""
+    else:
+        for k in EMAIL_FIELDS:
+            ss[f"em_{k}"] = ""
+    ss.pop(f"last_{kind}", None)
+    ss.pop(f"notice_{kind}", None)
+
+
+def _on_screenshot(key: str) -> None:
+    up = ss.get(key)
+    ss["upload_n"] += 1  # fresh uploader next run
+    if up is None:
+        return
+    extracted = image_to_text(up.getvalue())
+    if extracted:
+        _load_sms(extracted)
+    else:
+        _notice("sms", "warn", "Walang nabasang text sa screenshot.",
+                "Subukan ang mas malinaw na screenshot, o i-paste na lang ang text.")
+
+
+def _on_eml(key: str) -> None:
+    up = ss.get(key)
+    ss["upload_n"] += 1
+    if up is None:
+        return
+    try:
+        from emailparse import parse_eml
+        parsed = parse_eml(up.getvalue())
+        _load_email({**parsed, "attachments": ", ".join(parsed.get("attachments") or [])})
+    except Exception:
+        _notice("email", "warn", "Hindi mabasa ang .eml file.",
+                "Baka sira o ibang format ang file. I-paste na lang ang subject at body.")
+
+
+def _reload_history(item: dict) -> None:
+    kind = item["kind"] if item["kind"] in ("sms", "email") else "sms"
+    ss["kind"] = kind
+    if kind == "sms":
+        ss["sms_text"] = item["text"]
+    else:
+        for k in EMAIL_FIELDS:
+            ss[f"em_{k}"] = ""
+        ss["em_body"] = item["text"]
+    _request_scan(kind, save=False)
+
+
+def _clear_history() -> None:
+    # Backend request: expose db.clear(). Until then, delete via the same
+    # SQLite file db.py writes to, without touching db.py itself.
+    clear = getattr(db, "clear", None)
+    try:
+        if callable(clear):
+            clear()
         else:
-            merged.append((s, e))
-    heavy = any(f["weight"] >= 25 for f in flags)
-    color = "#ffcdd2" if heavy else "#fff59d"
-    out, pos = [], 0
-    for s, e in merged:
-        out.append(html.escape(text[pos:s]))
-        out.append(f'<mark style="background:{color};padding:1px 2px;'
-                   f'border-radius:3px">{html.escape(text[s:e])}</mark>')
-        pos = e
-    out.append(html.escape(text[pos:]))
-    return "".join(out)
+            with sqlite3.connect(db.DB_FILE) as c:
+                c.execute("DELETE FROM scans")
+    except Exception:
+        pass
+    ss.pop("confirm_clear", None)
 
 
-def _meter(score: int, level: str) -> str:
-    color = {"red": "#b71c1c", "yellow": "#ef6c00", "green": "#2e7d32"}[level]
-    return (
-        f'<div style="background:#e0e0e0;border-radius:6px;height:18px">'
-        f'<div style="background:{color};width:{score}%;height:18px;'
-        f'border-radius:6px;text-align:right;color:white;font-size:12px;'
-        f'line-height:18px;padding-right:6px;box-sizing:border-box">{score}/100</div>'
-        f'</div>'
-    )
+# ---------------------------------------------------------------------------
+# Scan
+# ---------------------------------------------------------------------------
 
-
-def _warning_text(level: str, source: str) -> str:
-    if level == "red":
-        return (f"PAALALA MULA SA BANTAY-BOSES: {source} — dinetekta itong SCAM. "
-                "Huwag pong i-click ang link, huwag magbigay ng OTP o password, at "
-                "huwag magpadala ng pera. I-report ito sa totoong opisyal na app o "
-                "hotline ng bangko/wallet.")
-    if level == "yellow":
-        return (f"PAALALA MULA SA BANTAY-BOSES: {source} — mukhang duda o scam ito. "
-                "Mag-ingat, huwag i-click ang link, at i-verify muna sa opisyal na "
-                "app bago gumawa ng anumang aksyon.")
-    return ""
-
-
-def _render_result(result: dict, display_text: str, latency: float,
-                   source_label: str, meta: dict | None = None) -> None:
-    level = result["level"]
-    icon, label, color, sub = LEVEL_STYLE[level]
-    st.markdown(
-        f'<div style="background:{color};color:white;padding:14px 18px;'
-        f'border-radius:10px;font-size:26px;font-weight:700;margin-bottom:4px">'
-        f'{icon} {label} &nbsp; <span style="font-size:16px;font-weight:400">'
-        f'({result["score"]}/100)</span></div>'
-        f'<div style="color:#bbb;font-size:14px;margin-bottom:12px">{sub}</div>',
-        unsafe_allow_html=True)
-    st.markdown(_meter(result["score"], level), unsafe_allow_html=True)
-
-    if result["flags"]:
-        st.markdown("**🚩 Mga nakuha ng rules:**")
-        chips = []
-        for f in result["flags"]:
-            chips.append(
-                f'<span style="display:inline-block;background:#262626;'
-                f'border:1px solid #555;border-radius:14px;padding:3px 10px;'
-                f'margin:2px 4px 2px 0;font-size:13px">{html.escape(f["name"])} '
-                f'<b style="color:#ff8a80">+{f["weight"]}</b></span>')
-        st.markdown("".join(chips), unsafe_allow_html=True)
-        st.markdown(
-            f'<div style="background:#1e1e1e;border:1px solid #333;'
-            f'border-radius:8px;padding:12px;font-size:15px;line-height:1.7">'
-            f"{_highlight(display_text, result['flags'])}</div>",
-            unsafe_allow_html=True)
-        with st.expander("Detalyadong flags (para sa judges)"):
-            st.table([{"flag": f["name"], "weight": f["weight"],
-                       "match": f["match"][:80]} for f in result["flags"]])
-
-    st.markdown(f"**💬 Paliwanag:** {result['explanation']}")
-    st.info(f"**Ano ang gawin:** {result['what_to_do']}")
-
-    if level in ("red", "yellow"):
-        warn = _warning_text(level, source_label)
-        st.markdown("**📋 Copy-ready warning (i-forward sa pamilya):**")
-        st.code(warn, language=None)
-        st.caption("I-copy ito at i-send sa family/group chat nang hindi na "
-                   "kailangang mag-type.")
-
-    l1, l2, l3 = st.columns(3)
-    l1.metric("⏱️ Latency", f"{latency:.2f}s")
-    l2.metric("🧠 LLM", "gumagana" if result["llm_used"] else "rules lang")
-    l3.metric("📴 Mode", "100% offline")
-    st.caption("100% local — hindi umaalis ang mensahe mo sa device na ito.")
-
-
-def _scan(kind: str, text: str, meta: dict | None) -> None:
+def _scan(kind: str, text: str, meta: dict | None, save: bool) -> None:
     t0 = perf_counter()
     rule_result = rules.check(text, kind, meta)
     llm_result = classify(text, kind, meta) if _llm_alive() else None
     result = scoring.combine(rule_result, llm_result)
     latency = perf_counter() - t0
-    db.save(kind, result["level"], result["score"], text)
-    st.session_state[f"last_{kind}"] = {
-        "text": text, "meta": meta, "result": result, "latency": latency,
-    }
+    if save:
+        db.save(kind, result["level"], result["score"], text)
+    ss[f"last_{kind}"] = {"text": text, "meta": meta, "result": result, "latency": latency}
 
 
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
-
-with st.sidebar:
-    st.markdown("## 🛡️ Bantay-Boses")
-    st.caption("Offline na scam & phishing detector para sa SMS at email ng "
-               "mga Pilipino.")
-    st.divider()
-    st.markdown(f"**LM Studio server:** "
-                f"{'🟢 konektado' if _llm_alive() else '🔴 hindi konektado'}")
-    if not _llm_alive():
-        st.warning("Buksan ang LM Studio → Start Server (port 1234). "
-                   "Gumagana pa rin ang rules kahit walang LLM.")
-    st.caption("Qwen2.5 3B Instruct (GGUF) · llama.cpp · walang cloud API")
-    st.divider()
-    lola = st.toggle("👵 Lola Mode — mas malaking font, mas simpleng Taglish",
-                     value=st.session_state.get("lola", False),
-                     key="lola")
-    st.divider()
-    st.markdown("**📜 Scan history**")
-    hist = db.history(10)
-    if hist:
-        for h in hist:
-            icon = LEVEL_STYLE.get(h["level"], ("", "", "", ""))[0]
-            st.caption(f"{icon} {h['kind']} · {h['score']}/100 · "
-                       f"{h['text'][:45]}{'…' if len(h['text']) > 45 else ''}")
+def _run_pending() -> None:
+    pending = ss.pop("pending_scan", None)
+    if not pending:
+        return
+    kind, save = pending
+    ss.pop(f"notice_{kind}", None)
+    if kind == "sms":
+        text, meta = (ss.get("sms_text") or "").strip(), None
+        empty_msg = "I-paste muna ang text, o pindutin ang isang demo sa ibaba."
     else:
-        st.caption("Wala pang naka-scan.")
+        body, subject = (ss.get("em_body") or "").strip(), (ss.get("em_subject") or "").strip()
+        text = body or subject
+        meta = {
+            "sender": ss.get("em_sender", ""), "reply_to": ss.get("em_reply_to", ""),
+            "subject": subject,
+            "attachments": [a.strip() for a in (ss.get("em_attachments") or "").split(",") if a.strip()],
+        }
+        empty_msg = "Ilagay muna ang subject o body ng email, o pindutin ang isang demo."
+    if not text:
+        ss.pop(f"last_{kind}", None)
+        _notice(kind, "warn", "Wala pang mensahe.", empty_msg)
+        return
+    try:
+        with st.spinner("Sina-scan ang mensahe…"):
+            _scan(kind, text, meta, save)
+    except Exception:
+        _notice(kind, "warn", "Hindi natapos ang scan.",
+                "Pindutin ulit ang Scan. Kung paulit-ulit, i-restart ang app.")
 
-if st.session_state.get("lola"):
-    st.markdown(
-        "<style>html{font-size:20px} .stTextArea textarea{font-size:20px} "
-        "p,li{font-size:20px}</style>", unsafe_allow_html=True)
+
+def _warning_text(level: str, source: str) -> str:
+    if level == "red":
+        return (f"Paalala mula sa Bantay-Boses: {source} ay SCAM. Huwag i-click ang link, "
+                "huwag ibigay ang OTP o password, at huwag magpadala ng pera. I-report sa "
+                "opisyal na app o hotline ng bangko o e-wallet.")
+    return (f"Paalala mula sa Bantay-Boses: {source} ay kahina-hinala. Huwag munang i-click "
+            "ang link. I-verify muna sa opisyal na app bago gumawa ng kahit ano.")
+
 
 # ---------------------------------------------------------------------------
-# Tabs
+# Result rendering
 # ---------------------------------------------------------------------------
 
-sms_tab, email_tab = st.tabs(["✉️ SMS / Chat", "📧 Email"])
+def _render_result(kind: str, data: dict, lola: bool) -> None:
+    result, text = data["result"], data["text"]
+    level, flags = result["level"], result["flags"]
+    meta = data.get("meta") or {}
+    source = (f'Ang email na "{meta["subject"]}"' if meta.get("subject")
+              else ("Ang email na ito" if kind == "email" else "Ang text na ito"))
 
-# ------------------------------------------------------------------ SMS tab --
-with sms_tab:
-    st.caption("I-paste ang laman ng scam text, o pindutin ang isang sample.")
+    if lola:
+        st.html(ui.lola_verdict(level))
+        st.html(ui.section("Bakit?", ui.paragraph(result["explanation"])))
+        st.html(ui.section("Ano ang gagawin", ui.action(result["what_to_do"], level)))
+        if level != "green":
+            st.html(ui.section("Ipadala sa pamilya", ""))
+            ui.copy_warning(_warning_text(level, source), lola=True)
+        return
 
-    c1, c2, c3 = st.columns(3)
-    if c1.button("🔴 Sample: GCash scam", use_container_width=True):
-        st.session_state["sms_text"] = SAMPLE_SMS_SCAM
-        st.session_state["auto_scan_sms"] = True
-    if c2.button("🟢 Sample: Legit bank text", use_container_width=True):
-        st.session_state["sms_text"] = SAMPLE_SMS_LEGIT
-        st.session_state["auto_scan_sms"] = True
-    if c3.button("🗑️ Clear", use_container_width=True):
-        st.session_state["sms_text"] = ""
-        st.session_state.pop("last_sms", None)
+    st.html(ui.verdict_card(level, result["score"]))
+    st.html(ui.section("Paliwanag", ui.paragraph(result["explanation"])))
+    if level == "green":
+        st.html(ui.section("Ano ang sinuri namin", ui.safe_checks(kind)))
+    st.html(ui.section("Ano ang gawin", ui.action(result["what_to_do"], level)))
 
-    if OCR_OK:
-        up = st.file_uploader("📷 O para: mag-upload ng screenshot ng text (OCR)",
-                              type=["png", "jpg", "jpeg", "webp"])
-        if up is not None:
-            extracted = image_to_text(up.getvalue())
-            if extracted:
-                st.session_state["sms_text"] = extracted
-                st.session_state["auto_scan_sms"] = True
-                st.rerun()
+    if flags:
+        st.html(ui.section(
+            "Mga palatandaan sa mensahe",
+            '<p class="bb-caption" style="margin-bottom:var(--s-3)">'
+            "I-hover o i-tap ang naka-highlight para makita kung bakit.</p>"
+            + ui.highlighted_message(text, flags) + ui.flag_list(flags)))
+
+    if level != "green":
+        st.html(ui.section("I-forward ang babala",
+                           '<p class="bb-caption" style="margin-bottom:var(--s-3)">'
+                           "Isang pindot lang, tapos i-paste sa family o group chat.</p>"))
+        ui.copy_warning(_warning_text(level, source))
+
+    st.write("")
+    with st.expander("Detalye ng scan", icon=":material/tune:"):
+        st.html(ui.details_table(flags, data["latency"], result["llm_used"]))
+
+
+def _render_notice(kind: str) -> None:
+    n = ss.get(f"notice_{kind}")
+    if n:
+        st.html(ui.callout(*n))
+
+
+# ---------------------------------------------------------------------------
+# Input panels
+# ---------------------------------------------------------------------------
+
+def _demo_row(kind: str, lola: bool) -> None:
+    scam_label = "Scam: GCash “suspended” text" if kind == "sms" else "Scam: pekeng BDO email"
+    legit_label = "Legit: BPI credit alert" if kind == "sms" else "Legit: BDO eStatement"
+    load = (lambda s: _load_sms(s)) if kind == "sms" else (lambda s: _load_email(s))
+    scam = SAMPLE_SMS_SCAM if kind == "sms" else SAMPLE_EMAIL_SCAM
+    legit = SAMPLE_SMS_LEGIT if kind == "sms" else SAMPLE_EMAIL_LEGIT
+
+    def _buttons() -> None:
+        c1, c2 = st.columns(2)
+        c1.button(scam_label, icon=":material/gpp_bad:", use_container_width=True,
+                  key=f"demo_scam_{kind}", on_click=load, args=(scam,))
+        c2.button(legit_label, icon=":material/verified_user:", use_container_width=True,
+                  key=f"demo_legit_{kind}", on_click=load, args=(legit,))
+
+    if lola:
+        with st.popover("Subukan ang halimbawa", icon=":material/play_circle:",
+                        use_container_width=True):
+            _buttons()
+        return
+    st.html('<div class="bb-demo-head"><p class="bb-label">Subukan ang demo</p>'
+            '<p class="bb-caption">Scam at legit, magkatabi</p></div>')
+    _buttons()
+
+
+def _has_content(kind: str) -> bool:
+    if f"last_{kind}" in ss:
+        return True
+    if kind == "sms":
+        return bool((ss.get("sms_text") or "").strip())
+    return any((ss.get(f"em_{k}") or "").strip() for k in EMAIL_FIELDS)
+
+
+def _scan_row(kind: str, lola: bool) -> None:
+    label = "Scan" if kind == "sms" else "Scan email"
+    if lola:
+        st.button(label, type="primary", icon=":material/search:", use_container_width=True,
+                  key=f"scan_{kind}", on_click=_request_scan, args=(kind,))
+        return
+    c1, c2 = st.columns([3, 1.3], vertical_alignment="bottom")
+    c1.button(label, type="primary", icon=":material/search:", use_container_width=True,
+              key=f"scan_{kind}", on_click=_request_scan, args=(kind,))
+    with c2:
+        if kind == "sms":
+            with st.popover("Screenshot", icon=":material/photo_camera:", use_container_width=True):
+                if OCR_OK:
+                    key = f"ocr_{ss['upload_n']}"
+                    st.file_uploader("Mag-upload ng screenshot ng text", key=key,
+                                     type=["png", "jpg", "jpeg", "webp"],
+                                     on_change=_on_screenshot, args=(key,))
+                    st.caption("Babasahin ang text sa device mo, tapos isa-scan agad.")
+                else:
+                    st.html(ui.callout("info", "Hindi pa naka-install ang OCR.",
+                                       "I-install ang Tesseract para gumana ang screenshot upload. "
+                                       "Sa ngayon, i-paste na lang ang text."))
+        else:
+            with st.popover(".eml file", icon=":material/attach_file:", use_container_width=True):
+                key = f"eml_{ss['upload_n']}"
+                st.file_uploader("Mag-upload ng .eml file", type=["eml"], key=key,
+                                 on_change=_on_eml, args=(key,))
+                st.caption("Kukunin ang sender, subject at body, tapos isa-scan agad.")
+
+
+def _sms_panel(lola: bool) -> None:
+    st.text_area("Mensahe", key="sms_text", height=220 if lola else 200,
+                 placeholder=("Idikit dito ang text…" if lola else
+                              "I-paste dito ang text o chat. Halimbawa: “GCash: Your account "
+                              "will be suspended within 24 hours…”"))
+    _scan_row("sms", lola)
+
+
+def _email_panel(lola: bool) -> None:
+    c1, c2 = st.columns(2)
+    c1.text_input("Sender", key="em_sender", placeholder="BDO Unibank <alerts@bdo.com.ph>")
+    c2.text_input("Subject", key="em_subject", placeholder="Your eStatement is ready")
+    st.text_area("Body", key="em_body", height=200, placeholder="I-paste dito ang laman ng email…")
+    if not lola:
+        with st.expander("Reply-To at attachments (optional)"):
+            r1, r2 = st.columns(2)
+            r1.text_input("Reply-To", key="em_reply_to", placeholder="verify@example.com")
+            r2.text_input("Attachments", key="em_attachments", placeholder="invoice.zip, form.pdf")
+    _scan_row("email", lola)
+
+
+# ---------------------------------------------------------------------------
+# Sidebar: engine status, history, about
+# ---------------------------------------------------------------------------
+
+def _sidebar(llm_on: bool) -> None:
+    with st.sidebar:
+        st.html(ui.brand(llm_on))
+
+        st.html('<p class="bb-label bb-side-h">Engine</p>')
+        if llm_on:
+            st.html('<div class="bb-status"><i></i>AI + rules · Qwen2.5 3B sa LM Studio</div>')
+        else:
+            st.html('<div class="bb-status off"><i></i>Rules lang · gumagana nang buo</div>')
+            st.caption("Para sa mas detalyadong paliwanag, buksan ang LM Studio at i-Start "
+                       "Server sa port 1234.")
+
+        st.html('<p class="bb-label bb-side-h">Scan history</p>')
+        hist = db.history(12)
+        if not hist:
+            st.caption("Wala pang na-scan. Lalabas dito ang mga huling scan mo.")
+        for i, h in enumerate(hist):
+            lv = ui.LEVELS.get(h["level"], ui.LEVELS["yellow"])
+            snippet = " ".join(h["text"].split())[:38]
+            kind = "SMS" if h["kind"] == "sms" else "Email"
+            st.button(f"{lv['word']} {h['score']} · {kind} · {snippet}", key=f"hist_{i}",
+                      icon=lv["history"], use_container_width=True,
+                      help="I-load at i-scan ulit", on_click=_reload_history, args=(h,))
+        if hist:
+            if ss.get("confirm_clear"):
+                st.caption("Buburahin ang lahat ng history sa device na ito. Sigurado ka?")
+                a, b = st.columns(2)
+                a.button("Oo, burahin", type="primary", use_container_width=True,
+                         on_click=_clear_history)
+                b.button("Huwag", use_container_width=True,
+                         on_click=lambda: ss.pop("confirm_clear", None))
             else:
-                st.warning("Walang nabasa mula sa screenshot. I-paste na lang "
-                           "ang text nang mano-mano.")
-    else:
-        st.caption("📷 OCR: i-install ang Tesseract upang magamit ang screenshot "
-                   "upload.")
+                st.button("Burahin ang history", type="tertiary", icon=":material/delete:",
+                          on_click=lambda: ss.update(confirm_clear=True))
 
-    text = st.text_area("Laman ng mensahe", height=180, key="sms_text",
-                        placeholder="Hal.: GCash: Your account will be suspended...")
+        st.html('<p class="bb-label bb-side-h">Tungkol</p>')
+        st.caption("Offline na scam at phishing checker para sa SMS at email sa Pilipinas. "
+                   "Hindi umaalis ang mensahe mo sa device na ito.")
 
-    do_scan = st.button("🔍 Scan", type="primary") or \
-        st.session_state.pop("auto_scan_sms", False)
-    if do_scan:
-        if (st.session_state.get("sms_text") or "").strip():
-            with st.spinner("Sinusuri..."):
-                _scan("sms", st.session_state["sms_text"].strip(), None)
-        else:
-            st.warning("Maglagay muna ng mensahe.")
 
-    if "last_sms" in st.session_state:
-        d = st.session_state["last_sms"]
-        st.divider()
-        _render_result(d["result"], d["text"], d["latency"], "sa SMS na ito")
+# ---------------------------------------------------------------------------
+# Page
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------- Email tab --
-with email_tab:
-    st.caption("I-paste ang detalye ng email, o gamitin ang sample.")
+lola = bool(ss.get("lola"))
+theme.inject(lola)
+llm_on = _llm_alive()
+_sidebar(llm_on)
 
-    e1, e2, e3 = st.columns(3)
-    if e1.button("🔴 Sample: Phishing email", use_container_width=True,
-                 key="es1"):
-        for k, v in SAMPLE_EMAIL_SCAM.items():
-            st.session_state[f"em_{k}"] = v
-        st.session_state["auto_scan_email"] = True
-    if e2.button("🟢 Sample: Legit email", use_container_width=True, key="es2"):
-        for k, v in SAMPLE_EMAIL_LEGIT.items():
-            st.session_state[f"em_{k}"] = v
-        st.session_state["auto_scan_email"] = True
-    if e3.button("🗑️ Clear", use_container_width=True, key="es3"):
-        for k in SAMPLE_EMAIL_SCAM:
-            st.session_state[f"em_{k}"] = ""
-        st.session_state.pop("last_email", None)
+head_l, head_r = st.columns([1, 1], vertical_alignment="center")
+with head_l:
+    st.html(ui.brand(llm_on))
+with head_r:
+    st.toggle("Lola Mode", key="lola", help="Mas malaking text, mas kaunting pindutan")
 
-    eml_file = st.file_uploader("📎 O kaya: i-upload ang .eml file", type=["eml"],
-                                key="em_eml")
-    if eml_file is not None and eml_file.size:
-        try:
-            from emailparse import parse_eml
-            parsed = parse_eml(eml_file.getvalue())
-            st.session_state["em_sender"] = parsed["sender"]
-            st.session_state["em_reply_to"] = parsed["reply_to"]
-            st.session_state["em_subject"] = parsed["subject"]
-            st.session_state["em_body"] = parsed["body"]
-            st.session_state["em_attachments"] = ", ".join(parsed["attachments"])
-            st.session_state["auto_scan_email"] = True
-            st.rerun()
-        except Exception:
-            st.warning("Hindi ma-parse ang .eml file. I-paste na lang ang "
-                       "laman nang mano-mano.")
+if ss.get("kind") not in ("sms", "email"):
+    ss["kind"] = "sms"
 
-    s1, s2 = st.columns(2)
-    sender = s1.text_input("Sender (Name <email@domain>)", key="em_sender",
-                           placeholder="BDO Unibank <security@bdo-secure.net>")
-    reply_to = s2.text_input("Reply-To (optional)", key="em_reply_to")
-    subject = st.text_input("Subject", key="em_subject",
-                            placeholder="Unusual sign-in detected...")
-    body = st.text_area("Body", height=200, key="em_body",
-                        placeholder="Dear customer, ...")
-    attachments = st.text_input("Attachments (optional, comma-separated)",
-                                key="em_attachments",
-                                placeholder="statement_invoice.zip")
+_run_pending()
+kind = ss["kind"]
+st.html(ui.hero(compact=f"last_{kind}" in ss, lola=lola))
 
-    if st.button("🔍 Scan email", type="primary", key="scan_email") or \
-            st.session_state.pop("auto_scan_email", False):
-        if body.strip() or subject.strip():
-            meta = {
-                "sender": sender, "reply_to": reply_to, "subject": subject,
-                "attachments": [a.strip() for a in attachments.split(",") if a.strip()],
-            }
-            with st.spinner("Sinusuri..."):
-                _scan("email", body or subject, meta)
-        else:
-            st.warning("Maglagay muna ng email body.")
+st.segmented_control(
+    "Uri ng mensahe", options=["sms", "email"], key="kind", label_visibility="collapsed",
+    format_func=lambda k: ":material/sms: SMS / Chat" if k == "sms" else ":material/mail: Email",
+    on_change=lambda: ss.update(kind=ss.get("kind") or "sms"))
 
-    if "last_email" in st.session_state:
-        d = st.session_state["last_email"]
-        st.divider()
-        label = f"sa email na ito"
-        if d["meta"] and d["meta"].get("subject"):
-            label = f'ang email na "{d["meta"]["subject"]}"'
-        _render_result(d["result"], d["text"], d["latency"], label, d["meta"])
+if kind == "sms":
+    _sms_panel(lola)
+else:
+    _email_panel(lola)
 
-st.divider()
-st.caption("Bantay-Boses · AppBuildersPH Hackathon 2026 · 100% on-device: "
-           "Qwen2.5 3B via LM Studio · walang cloud API · walang pinapadalang "
-           "mensahe sa labas ng device.")
+_render_notice(kind)
+
+if f"last_{kind}" in ss:
+    _render_result(kind, ss[f"last_{kind}"], lola)
+    st.button("Mag-scan ng bago", icon=":material/restart_alt:", type="tertiary",
+              key=f"clear_{kind}", on_click=_clear, args=(kind,))
+else:
+    if _has_content(kind) and not lola:
+        st.button("Burahin", icon=":material/backspace:", type="tertiary",
+                  key=f"clear_{kind}", on_click=_clear, args=(kind,))
+    _demo_row(kind, lola)
+
+st.html(ui.footer())
